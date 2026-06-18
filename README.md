@@ -1,6 +1,6 @@
 # PCIscript
 
-Creates Drata evidence library placeholders from a Baker Tilly artifact list CSV. Names each item with a BU prefix (`[GLOBAL]`, `[MINDBODY]`, `[CLASSPASS]`, `[BOOKER]`) and links it to the relevant DCF controls at creation time.
+Creates Drata evidence library placeholders from an artifact list CSV. Names each item with a BU prefix (`[GLOBAL]`, `[MINDBODY]`, `[CLASSPASS]`, `[BOOKER]`) and links it to the relevant DCF controls at creation time.
 
 ## Requirements
 
