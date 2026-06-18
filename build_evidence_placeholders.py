@@ -5,9 +5,9 @@ build_evidence_placeholders.py
 Creates Drata evidence library placeholders from the Baker Tilly artifact list CSV.
 
 Usage:
-    python3.11 build_evidence_placeholders.py <csv_path>          # dry run
-    python3.11 build_evidence_placeholders.py <csv_path> --live   # execute writes
-    python3.11 build_evidence_placeholders.py <csv_path> --live --map-suffix MAI=mindbody
+    python3.11 build_evidence_placeholders.py --input <csv_path>
+    python3.11 build_evidence_placeholders.py --input <csv_path> --live
+    python3.11 build_evidence_placeholders.py --input <csv_path> --live --map-suffix MAI=mindbody
 """
 
 import argparse
@@ -46,27 +46,19 @@ def build_session(api_key: str) -> requests.Session:
         total=5,
         backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+        allowed_methods=["GET"],
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
     session = requests.Session()
     session.mount("https://", adapter)
-    session.headers.update({
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    })
+    session.headers.update({"Authorization": f"Bearer {api_key}"})
     return session
 
 # ─── API Helpers ──────────────────────────────────────────────────────────────
 
 def get_workspaces(session: requests.Session) -> list[dict]:
-    resp = session.get(f"{API_BASE_URL}/workspaces")
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list):
-        return data
-    return data.get("data", [])
+    return paginate(session, f"{API_BASE_URL}/workspaces")
 
 
 def paginate(session: requests.Session, url: str, params: dict | None = None) -> list[dict]:
@@ -90,37 +82,26 @@ def build_pci_to_control_ids(session: requests.Session, workspace_id: int) -> di
     """Build PCI req code → list of non-archived DCF control IDs (built at startup)."""
     print("  Building PCI → DCF control ID lookup (~52 API calls)...")
     url = f"{API_BASE_URL}/workspaces/{workspace_id}/framework-requirements"
-    params: dict = {
+    params = {
         "frameworkTag": FRAMEWORK_TAG,
         "isInScope": "true",
-        "size": 50,
         "expand[]": "controls",
     }
+    reqs = paginate(session, url, params)
     lookup: dict[str, list[int]] = {}
-    page = 0
-    cursor = None
-    while True:
-        if cursor:
-            params["cursor"] = cursor
-        resp = session.get(url, params=params)
-        resp.raise_for_status()
-        body = resp.json()
-        page += 1
-        for req in body.get("data", []):
-            pci_code = req.get("name", "").strip()
-            if not pci_code:
-                continue
-            control_ids = [
-                c["id"]
-                for c in req.get("controls", {}).get("data", [])
-                if c.get("archivedAt") is None
-            ]
-            if control_ids:
-                lookup[pci_code] = control_ids
-        cursor = body.get("pagination", {}).get("cursor")
-        if not cursor:
-            break
-    print(f"  Loaded {len(lookup)} PCI codes with linked controls ({page} pages).")
+    for req in reqs:
+        pci_code = req.get("name", "").strip()
+        if not pci_code:
+            continue
+        control_ids = [
+            c["id"]
+            for c in req.get("controls", {}).get("data", [])
+            if c.get("archivedAt") is None
+        ]
+        if control_ids:
+            existing = lookup.get(pci_code, [])
+            lookup[pci_code] = list(dict.fromkeys(existing + control_ids))
+    print(f"  Loaded {len(lookup)} PCI codes with linked controls.")
     return lookup
 
 
@@ -160,9 +141,12 @@ def parse_pci_codes(col2: str) -> list[str]:
 def build_name(bu_prefix: str, base_id: str, short_title: str) -> str:
     prefix_part = f"[{bu_prefix}] {base_id} "
     budget = NAME_MAX - len(prefix_part)
+    if budget <= 0:
+        return prefix_part[:NAME_MAX]
     if len(short_title) > budget:
-        short_title = short_title[: budget - 3] + "..."
-    return prefix_part + short_title
+        take = max(0, budget - 3)
+        short_title = short_title[:take] + "..."
+    return (prefix_part + short_title).rstrip()
 
 # ─── Routing ──────────────────────────────────────────────────────────────────
 
@@ -184,9 +168,13 @@ def get_routing(
     # R4 — unknown suffix (A/FMX/MAI)
     if suffix in UNKNOWN_SUFFIXES:
         override = suffix_overrides.get(suffix)
-        if override is None or override == "skip":
+        if override is None:
             return None
         return [(override, BU_PREFIX_LABEL[override])]
+
+    # Any non-empty suffix not handled above is unrouted
+    if suffix:
+        return None
 
     # No suffix — R1 or R2
     # R1 — GLOBAL: org-wide categories or PA- prefix items
@@ -221,7 +209,9 @@ def create_evidence_item(
     if dry_run:
         return "DRYRUN", None, None
 
-    body: dict = {"name": name, "description": description}
+    body: dict = {"name": name}
+    if description:
+        body["description"] = description
     if control_ids:
         body["controlIds"] = control_ids
 
@@ -405,6 +395,12 @@ def main() -> None:
         suffix, wkey = mapping.split("=", 1)
         suffix = suffix.strip().upper()
         wkey = wkey.strip().lower()
+        if not suffix:
+            print(f"ERROR: --map-suffix suffix cannot be empty (got: {mapping!r})", file=sys.stderr)
+            sys.exit(1)
+        if suffix not in UNKNOWN_SUFFIXES:
+            print(f"ERROR: --map-suffix suffix must be one of {sorted(UNKNOWN_SUFFIXES)} (got: {suffix!r})", file=sys.stderr)
+            sys.exit(1)
         if wkey not in valid_targets:
             print(f"ERROR: workspace target must be one of {valid_targets} (got: {wkey!r})", file=sys.stderr)
             sys.exit(1)
@@ -436,8 +432,19 @@ def main() -> None:
             existing_names[role] = names
             print(f"  {role}: {len(names)} existing item(s)")
         except requests.RequestException as e:
-            print(f"  WARNING: Could not pre-fetch {role} (id: {ws_id}): {e} — will create without idempotency check")
+            if args.live:
+                print(f"ERROR: Cannot pre-fetch existing names for '{role}' (id: {ws_id}) — aborting --live run to prevent duplicates.", file=sys.stderr)
+                sys.exit(1)
+            print(f"  WARNING: Could not pre-fetch {role}: {e} — dry-run unaffected")
             existing_names[role] = set()
+
+    # Validate CSV is readable before creating output files
+    try:
+        with open(args.csv_path, newline="", encoding="utf-8-sig"):
+            pass
+    except OSError as e:
+        print(f"ERROR: Cannot read input CSV: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Output files
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -507,13 +514,7 @@ def main() -> None:
                 raw_ids: list[int] = []
                 for code in pci_codes:
                     raw_ids.extend(pci_to_control_ids.get(code, []))
-                # Deduplicate while preserving order
-                seen_ids: set[int] = set()
-                control_ids: list[int] = []
-                for cid in raw_ids:
-                    if cid not in seen_ids:
-                        seen_ids.add(cid)
-                        control_ids.append(cid)
+                control_ids = list(dict.fromkeys(raw_ids))
 
                 # Determine routing
                 routing = get_routing(base_id, suffix, category, suffix_routing)
