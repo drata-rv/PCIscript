@@ -308,6 +308,11 @@ def resolve_api_key() -> str:
         key = API_KEY.strip()
     if not key:
         key = getpass.getpass("Drata API key: ").strip()
+        try:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        except Exception:
+            pass
     if not key:
         print("ERROR: No API key provided.", file=sys.stderr)
         sys.exit(1)
