@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Script output artifacts
+run_log_*.csv
+unrouted_*.csv
