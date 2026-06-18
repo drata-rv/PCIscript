@@ -327,7 +327,7 @@ def _pick_workspace(workspaces: list[dict], prompt: str) -> int:
             idx = int(raw) - 1
             if 0 <= idx < len(workspaces):
                 ws = workspaces[idx]
-                print(f"    → {ws['name']}  (id: {ws['id']})")
+                print(f"    → {ws['name']}")
                 return ws["id"]
             print(f"    Enter a number between 1 and {len(workspaces)}.")
         except ValueError:
@@ -363,7 +363,7 @@ def interactive_startup(
     print(f"\nFound {len(workspaces)} workspace(s):")
     for i, ws in enumerate(workspaces, 1):
         primary_tag = "  [PRIMARY]" if ws.get("primary") else ""
-        print(f"  [{i}] {ws['name']}  (id: {ws['id']}){primary_tag}")
+        print(f"  [{i}] {ws['name']}{primary_tag}")
 
     # Step 3: workspace role assignment
     role_labels = {
