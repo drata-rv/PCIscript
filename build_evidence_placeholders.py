@@ -39,6 +39,11 @@ BU_PREFIX_LABEL = {
 }
 NAME_MAX = 191
 
+# Baker Tilly CSV uses sub-procedure notation (e.g. A1.1.2.b); Drata maps at requirement level.
+PCI_CODE_ALIASES: dict[str, str] = {
+    "A1.1.2.b": "A1.1.2",
+}
+
 # ─── Session Setup ────────────────────────────────────────────────────────────
 
 def build_session(api_key: str) -> requests.Session:
@@ -576,7 +581,7 @@ def main() -> None:
                 pci_codes = parse_pci_codes(pci_raw)
                 raw_ids: list[int] = []
                 for code in pci_codes:
-                    raw_ids.extend(pci_to_control_ids.get(code, []))
+                    raw_ids.extend(pci_to_control_ids.get(PCI_CODE_ALIASES.get(code, code), []))
                 control_ids = list(dict.fromkeys(raw_ids))
 
                 # Determine routing
