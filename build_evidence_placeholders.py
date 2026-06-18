@@ -105,11 +105,18 @@ def build_pci_to_control_ids(session: requests.Session, workspace_id: int) -> di
     return lookup
 
 
-def fetch_existing_names(session: requests.Session, workspace_id: int) -> set[str]:
-    """Pre-fetch all existing evidence names for idempotency check."""
+def fetch_existing_evidence(session: requests.Session, workspace_id: int) -> dict[str, dict]:
+    """Pre-fetch all existing evidence items. Returns name → {id, control_ids}."""
     url = f"{API_BASE_URL}/workspaces/{workspace_id}/evidence-library"
-    items = paginate(session, url)
-    return {item["name"] for item in items if item.get("name")}
+    items = paginate(session, url, {"expand[]": "controls"})
+    result: dict[str, dict] = {}
+    for item in items:
+        name = item.get("name")
+        if not name:
+            continue
+        ctrl_ids = [c["id"] for c in item.get("controls", []) if c.get("id")]
+        result[name] = {"id": item["id"], "control_ids": ctrl_ids}
+    return result
 
 # ─── Parsing ──────────────────────────────────────────────────────────────────
 
@@ -197,13 +204,13 @@ def create_evidence_item(
     description: str,
     control_ids: list[int],
     dry_run: bool,
-    existing_names: set[str],
+    existing_evidence: dict[str, dict],
 ) -> tuple[str, int | None, str | None]:
     """
     Returns (action, http_status, error_message).
     action: "CREATE" | "SKIP" | "DRYRUN" | "ERROR"
     """
-    if name in existing_names:
+    if name in existing_evidence:
         return "SKIP", None, None
 
     if dry_run:
@@ -221,8 +228,49 @@ def create_evidence_item(
             json=body,
         )
         if resp.status_code in (200, 201):
-            existing_names.add(name)
+            data = resp.json()
+            existing_evidence[name] = {"id": data.get("id"), "control_ids": control_ids}
             return "CREATE", resp.status_code, None
+        try:
+            err_msg = resp.json().get("message", resp.text[:200])
+        except Exception:
+            err_msg = resp.text[:200]
+        return "ERROR", resp.status_code, err_msg
+    except requests.RequestException as e:
+        return "ERROR", None, str(e)
+
+def update_evidence_item(
+    session: requests.Session,
+    workspace_id: int,
+    evidence_id: int,
+    name: str,
+    control_ids: list[int],
+    dry_run: bool,
+    current_control_ids: list[int],
+) -> tuple[str, int | None, str | None]:
+    """
+    Updates controlIds on an existing evidence item.
+    Returns (action, http_status, error_message).
+    action: "UPDATE" | "NOOP" | "DRYRUN" | "ERROR"
+    Never clears controlIds — if control_ids is empty, returns NOOP.
+    """
+    if not control_ids:
+        return "NOOP", None, None
+
+    if sorted(current_control_ids) == sorted(control_ids):
+        return "NOOP", None, None
+
+    if dry_run:
+        return "DRYRUN", None, None
+
+    body: dict = {"name": name, "controlIds": control_ids}
+    try:
+        resp = session.put(
+            f"{API_BASE_URL}/workspaces/{workspace_id}/evidence-library/{evidence_id}",
+            json=body,
+        )
+        if resp.status_code in (200, 201):
+            return "UPDATE", resp.status_code, None
         try:
             err_msg = resp.json().get("message", resp.text[:200])
         except Exception:
@@ -373,6 +421,16 @@ def main() -> None:
     parser.add_argument("--input", required=True, metavar="CSV_PATH", dest="csv_path", help="Path to Baker Tilly artifact list CSV")
     parser.add_argument("--live", action="store_true", help="Execute writes (default: dry run)")
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help=(
+            "Update existing evidence items to match the DCF control links from the CSV. "
+            "Without this flag, existing items are skipped. "
+            "Has no effect on items that do not yet exist (those are always created). "
+            "Never clears controlIds — items with no PCI codes in the CSV are left unchanged."
+        ),
+    )
+    parser.add_argument(
         "--map-suffix",
         action="append",
         default=[],
@@ -423,20 +481,20 @@ def main() -> None:
         print(f"ERROR: Failed to build DCF control lookup: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Pre-fetch existing evidence names per workspace (idempotency)
-    print("\nPre-fetching existing evidence names...")
-    existing_names: dict[str, set[str]] = {}
+    # Pre-fetch existing evidence per workspace (idempotency + update support)
+    print("\nPre-fetching existing evidence items...")
+    existing_evidence: dict[str, dict[str, dict]] = {}
     for role, ws_id in workspace_ids.items():
         try:
-            names = fetch_existing_names(session, ws_id)
-            existing_names[role] = names
-            print(f"  {role}: {len(names)} existing item(s)")
+            evidence = fetch_existing_evidence(session, ws_id)
+            existing_evidence[role] = evidence
+            print(f"  {role}: {len(evidence)} existing item(s)")
         except requests.RequestException as e:
             if args.live:
-                print(f"ERROR: Cannot pre-fetch existing names for '{role}' (id: {ws_id}) — aborting --live run to prevent duplicates.", file=sys.stderr)
+                print(f"ERROR: Cannot pre-fetch existing evidence for '{role}' (id: {ws_id}) — aborting --live run to prevent duplicates.", file=sys.stderr)
                 sys.exit(1)
             print(f"  WARNING: Could not pre-fetch {role}: {e} — dry-run unaffected")
-            existing_names[role] = set()
+            existing_evidence[role] = {}
 
     # Validate CSV is readable before creating output files
     try:
@@ -457,7 +515,7 @@ def main() -> None:
     ]
     unrouted_fields = ["request_id", "suffix", "category", "description", "reason"]
 
-    counts: dict[str, int] = {"CREATE": 0, "SKIP": 0, "DRYRUN": 0, "ERROR": 0, "UNROUTED": 0, "MALFORMED": 0}
+    counts: dict[str, int] = {"CREATE": 0, "UPDATE": 0, "NOOP": 0, "SKIP": 0, "DRYRUN": 0, "ERROR": 0, "UNROUTED": 0, "MALFORMED": 0}
 
     print(f"\n{'─' * 70}")
     print(f"  {'ACTION':<10}  {'WORKSPACE':<12}  NAME")
@@ -535,13 +593,24 @@ def main() -> None:
                 for workspace_key, bu_prefix in routing:
                     ws_id = workspace_ids[workspace_key]
                     name = build_name(bu_prefix, base_id, short_title)
-                    ws_existing = existing_names[workspace_key]
+                    ws_evidence = existing_evidence[workspace_key]
+                    ev = ws_evidence.get(name)
 
-                    action, http_status, error_msg = create_evidence_item(
-                        session, ws_id, name, description, control_ids,
-                        dry_run=not args.live,
-                        existing_names=ws_existing,
-                    )
+                    if ev is not None:
+                        if args.update:
+                            action, http_status, error_msg = update_evidence_item(
+                                session, ws_id, ev["id"], name, control_ids,
+                                dry_run=not args.live,
+                                current_control_ids=ev["control_ids"],
+                            )
+                        else:
+                            action, http_status, error_msg = "SKIP", None, None
+                    else:
+                        action, http_status, error_msg = create_evidence_item(
+                            session, ws_id, name, description, control_ids,
+                            dry_run=not args.live,
+                            existing_evidence=ws_evidence,
+                        )
                     counts[action] += 1
 
                     status_str = str(http_status) if http_status else ""
@@ -565,7 +634,9 @@ def main() -> None:
     print(f"\n{'─' * 70}")
     print(f"  Mode: {mode_label}")
     print(f"  CREATE:    {counts['CREATE']}")
-    print(f"  SKIP:      {counts['SKIP']}  (already existed)")
+    print(f"  UPDATE:    {counts['UPDATE']}  (existing items — control IDs changed)")
+    print(f"  NOOP:      {counts['NOOP']}  (existing items — control IDs already correct or no PCI codes)")
+    print(f"  SKIP:      {counts['SKIP']}  (existing items — --update not set)")
     print(f"  DRYRUN:    {counts['DRYRUN']}  (dry run — no writes)")
     print(f"  ERROR:     {counts['ERROR']}")
     print(f"  UNROUTED:  {counts['UNROUTED']}  → {unrouted_path}")
